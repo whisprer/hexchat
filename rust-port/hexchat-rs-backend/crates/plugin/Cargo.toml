@@ -1,0 +1,11 @@
+[package]
+name = "plugin"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+serde.workspace = true
+anyhow.workspace = true
+proto = { path = "../proto" }
+core = { path = "../core" }

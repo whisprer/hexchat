@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/proto",
+    "crates/core",
+    "crates/net",
+    "crates/config",
+    "crates/text",
+    "crates/dcc",
+    "crates/plugin",
+    "crates/cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "GPL-2.0-or-later"
+authors = ["woflfren & G-Petey"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio-rustls = "0.25"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-roots = "0.26"
+bytes = "1"
+camino = "1"
+parking_lot = "0.12"
+base64 = "0.22"
+async-trait = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+rustls-pemfile = "2.1"
+subtle = "2.5"

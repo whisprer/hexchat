@@ -1,0 +1,12 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+proto = { path = "../proto" }

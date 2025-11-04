@@ -1,0 +1,1475 @@
+
+
+Crates
+
+proto — IRC message parsing/formatting
+core — state machine and events
+net — async I/O and TLS
+config — persistent settings
+text — color/format helpers
+dcc — minimal DCC scaffolding
+plugin — plugin traits
+cli — example binary using the engine
+
+"""
+
+license_txt = """GPL-2.0-or-later"""
+
+(root / "Cargo.toml").write_text(workspace_toml.strip()+"\n")
+(root / "README.md").write_text(readme.strip()+"\n")
+(root / "LICENSE").write_text(license_txt)
+
+Create crates directories
+
+crates = ["proto", "core", "net", "config", "text", "dcc", "plugin", "cli"]
+for c in crates:
+(root / "crates" / c / "src").mkdir(parents=True, exist_ok=True)
+
+proto crate
+
+cargo_proto = """
+[package]
+name = "proto"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+serde.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+"""
+(root/"crates/proto/Cargo.toml").write_text(cargo_proto.strip()+"\n")
+
+lib_proto = r'''
+use anyhow::{Result, bail};
+
+/// IRCv3 tags map is represented minimally as key=value strings.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tags(pub Vec<(String, Option<String>)>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prefix {
+pub raw: String, // e.g. nick!user@host or servername
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+pub tags: Option<Tags>,
+pub prefix: Option<Prefix>,
+pub command: String,
+pub params: Vec<String>,
+}
+
+impl Message {
+pub fn to_line(&self) -> String {
+let mut out = String::new();
+if let Some(tags) = &self.tags {
+out.push('@');
+for (i,(k,v)) in tags.0.iter().enumerate() {
+if i>0 { out.push(';'); }
+out.push_str(k);
+if let Some(val) = v {
+out.push('=');
+out.push_str(val);
+}
+}
+out.push(' ');
+}
+if let Some(prefix) = &self.prefix {
+out.push(':');
+out.push_str(&prefix.raw);
+out.push(' ');
+}
+out.push_str(&self.command);
+for (i, p) in self.params.iter().enumerate() {
+out.push(' ');
+if i == self.params.len()-1 && (p.contains(' ') || p.is_empty()) {
+out.push(':');
+out.push_str(p);
+} else {
+out.push_str(p);
+}
+}
+out.push('\r');
+out.push('\n');
+out
+}
+}
+
+fn take_until<'a>(s: &'a str, ch: char) -> (&'a str, &'a str) {
+if let Some(idx) = s.find(ch) {
+(&s[..idx], &s[idx+1..])
+} else {
+(s, "")
+}
+}
+
+pub fn parse_line(mut s: &str) -> Result<Message> {
+let mut tags: Option<Tags> = None;
+let mut prefix: Option<Prefix> = None;
+s = s.trim_end_matches(|c| c == '\r' || c == '\n');
+
+if s.starts_with('@') {
+    let (tag_blob, rest) = take_until(&s[1..], ' ');
+    let mut kvs = Vec::new();
+    for part in tag_blob.split(';') {
+        if let Some(eq) = part.find('=') {
+            kvs.push((part[..eq].to_string(), Some(part[eq+1..].to_string())));
+        } else {
+            kvs.push((part.to_string(), None));
+        }
+    }
+    tags = Some(Tags(kvs));
+    s = rest;
+}
+
+if s.starts_with(':') {
+    let (pfx, rest) = take_until(&s[1..], ' ');
+    prefix = Some(Prefix{ raw: pfx.to_string() });
+    s = rest;
+}
+
+let (cmd, rest) = take_until(s, ' ');
+if cmd.is_empty() { bail!("missing command"); }
+let mut params = Vec::new();
+let mut r = rest;
+while !r.is_empty() {
+    if r.starts_with(':') {
+        params.push(r[1..].to_string());
+        r = "";
+        break;
+    }
+    let (p, rest2) = take_until(r, ' ');
+    if !p.is_empty() {
+        params.push(p.to_string());
+    }
+    r = rest2;
+}
+
+Ok(Message{ tags, prefix, command: cmd.to_string(), params })
+
+}
+
+#[cfg(test)]
+mod tests {
+use super::*;
+#[test]
+fn roundtrip() {
+let line = "@time=2024-01-01T00:00:00Z :nick!u@h PRIVMSG #chan :hello world\r\n";
+let m = parse_line(line).unwrap();
+assert_eq!(m.command, "PRIVMSG");
+assert_eq!(m.params.last().unwrap(), "hello world");
+let out = m.to_line();
+assert!(out.ends_with("\r\n"));
+}
+}
+'''
+(root/"crates/proto/src/lib.rs").write_text(lib_proto.strip()+"\n")
+
+core crate
+
+cargo_core = """
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+proto = { path = "../proto" }
+"""
+(root/"crates/core/Cargo.toml").write_text(cargo_core.strip()+"\n")
+
+lib_core = r'''
+use anyhow::Result;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use proto::Message;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ChannelId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+pub nick: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Channel {
+pub name: String,
+pub users: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerState {
+pub network: String,
+pub nick: String,
+pub channels: HashMap<ChannelId, Channel>,
+}
+
+#[derive(Clone)]
+pub struct Engine {
+inner: Arc<RwLock<ServerState>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Event {
+Welcome(String),
+Join { nick: String, channel: String },
+Part { nick: String, channel: String },
+PrivMsg { from: String, target: String, text: String },
+Notice { from: String, target: String, text: String },
+Topic { channel: String, text: String },
+Unknown(Message),
+}
+
+impl Engine {
+pub fn new(network: impl Into<String>, nick: impl Into<String>) -> Self {
+let state = ServerState {
+network: network.into(),
+nick: nick.into(),
+channels: HashMap::new(),
+};
+Self { inner: Arc::new(RwLock::new(state)) }
+}
+
+pub fn state(&self) -> ServerState {
+    self.inner.read().clone()
+}
+
+pub fn on_message(&self, msg: Message) -> Event {
+    let mut st = self.inner.write();
+    match msg.command.as_str() {
+        "001" => {
+            Event::Welcome(msg.params.get(1).cloned().unwrap_or_default())
+        }
+        "JOIN" => {
+            let who = msg.prefix.as_ref().map(|p| p.raw.split('!').next().unwrap_or(&p.raw).to_string()).unwrap_or_default();
+            let chan = msg.params.last().cloned().unwrap_or_default();
+            let id = ChannelId(chan.clone());
+            st.channels.entry(id.clone()).or_insert(Channel{
+                name: chan.clone(),
+                users: HashSet::new(),
+            }).users.insert(who.clone());
+            Event::Join{ nick: who, channel: chan }
+        }
+        "PART" => {
+            let who = msg.prefix.as_ref().map(|p| p.raw.split('!').next().unwrap_or(&p.raw).to_string()).unwrap_or_default();
+            let chan = msg.params.first().cloned().unwrap_or_default();
+            let id = ChannelId(chan.clone());
+            if let Some(c) = st.channels.get_mut(&id) {
+                c.users.remove(&who);
+            }
+            Event::Part{ nick: who, channel: chan }
+        }
+        "PRIVMSG" => {
+            let who = msg.prefix.as_ref().map(|p| p.raw.split('!').next().unwrap_or(&p.raw).to_string()).unwrap_or_default();
+            let target = msg.params.get(0).cloned().unwrap_or_default();
+            let text = msg.params.get(1).cloned().unwrap_or_default();
+            Event::PrivMsg{ from: who, target, text }
+        }
+        "NOTICE" => {
+            let who = msg.prefix.as_ref().map(|p| p.raw.split('!').next().unwrap_or(&p.raw).to_string()).unwrap_or_default();
+            let target = msg.params.get(0).cloned().unwrap_or_default();
+            let text = msg.params.get(1).cloned().unwrap_or_default();
+            Event::Notice{ from: who, target, text }
+        }
+        "332" => { // RPL_TOPIC
+            let chan = msg.params.get(1).cloned().unwrap_or_default();
+            let text = msg.params.get(2).cloned().unwrap_or_default();
+            Event::Topic{ channel: chan, text }
+        }
+        _ => Event::Unknown(msg),
+    }
+}
+
+}
+'''
+(root/"crates/core/src/lib.rs").write_text(lib_core.strip()+"\n")
+
+net crate
+
+cargo_net = """
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+proto = { path = "../proto" }
+"""
+(root/"crates/net/Cargo.toml").write_text(cargo_net.strip()+"\n")
+
+lib_net = r'''
+use anyhow::{Result, Context};
+use bytes::BytesMut;
+use proto::{Message, parse_line};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
+use tokio_rustls::rustls::{ClientConfig, ServerName};
+use tokio_rustls::TlsConnector;
+use tracing::{info, warn};
+
+pub struct Connection {
+stream: Box<dyn Io + Send + Sync>,
+buf: BytesMut,
+}
+
+#[async_trait::async_trait]
+pub trait Io {
+async fn read(&mut self, dst: &mut [u8]) -> Result<usize>;
+async fn write_all(&mut self, src: &[u8]) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl Io for TcpStream {
+async fn read(&mut self, dst: &mut [u8]) -> Result<usize> {
+Ok(AsyncReadExt::read(self, dst).await?)
+}
+async fn write_all(&mut self, src: &[u8]) -> Result<()> {
+Ok(AsyncWriteExt::write_all(self, src).await?)
+}
+}
+
+struct TlsIo(tokio_rustls::client::TlsStream<TcpStream>);
+
+#[async_trait::async_trait]
+impl Io for TlsIo {
+async fn read(&mut self, dst: &mut [u8]) -> Result<usize> {
+Ok(AsyncReadExt::read(&mut self.0, dst).await?)
+}
+async fn write_all(&mut self, src: &[u8]) -> Result<()> {
+Ok(AsyncWriteExt::write_all(&mut self.0, src).await?)
+}
+}
+
+impl Connection {
+pub async fn connect(host: &str, port: u16, tls: bool) -> Result<Self> {
+let addr = format!("{host}:{port}");
+let mut tcp = timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await??;
+tcp.set_nodelay(true)?;
+if tls {
+let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+roots.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta|{
+tokio_rustls::rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+ta.subject, ta.spki, ta.name_constraints)
+}));
+let cfg = ClientConfig::builder().with_safe_defaults().with_root_certificates(roots).with_no_client_auth();
+let connector = TlsConnector::from(Arc::new(cfg));
+let server_name = ServerName::try_from(host).context("invalid DNSname")?;
+let tls_stream = connector.connect(server_name, tcp).await?;
+Ok(Self{ stream: Box::new(TlsIo(tls_stream)), buf: BytesMut::with_capacity(4096) })
+} else {
+Ok(Self{ stream: Box::new(tcp), buf: BytesMut::with_capacity(4096) })
+}
+}
+
+pub async fn send_msg(&mut self, m: &Message) -> Result<()> {
+    let line = m.to_line();
+    self.stream.write_all(line.as_bytes()).await?;
+    Ok(())
+}
+
+pub async fn send_raw(&mut self, raw: &str) -> Result<()> {
+    let mut s = raw.to_string();
+    if !s.ends_with("\r\n") { s.push_str("\r\n"); }
+    self.stream.write_all(s.as_bytes()).await?;
+    Ok(())
+}
+
+pub async fn next_message(&mut self) -> Result<Message> {
+    let mut tmp = [0u8; 1024];
+    loop {
+        if let Some(idx) = self.buf.windows(2).position(|w| w == b"\r\n") {
+            let line = self.buf.split_to(idx + 2);
+            let s = String::from_utf8_lossy(&line).to_string();
+            match parse_line(&s) {
+                Ok(m) => return Ok(m),
+                Err(e) => warn!("parse error: {e}; line={s:?}"),
+            }
+        }
+        let n = self.stream.read(&mut tmp).await?;
+        if n == 0 { anyhow::bail!("connection closed"); }
+        self.buf.extend_from_slice(&tmp[..n]);
+    }
+}
+}
+'''
+(root/"crates/net/src/lib.rs").write_text(lib_net.strip()+"\n")
+
+config crate
+cargo_config = """
+[package]
+name = "config"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+camino.workspace = true
+"""
+(root/"crates/config/Cargo.toml").write_text(cargo_config.strip()+"\n")
+
+lib_config = r'''
+use anyhow::Result;
+use camino::Utf8PathBuf;
+use serde::{Deserialize, Serialize};
+use std::fs;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+pub server: String,
+pub port: u16,
+pub use_tls: bool,
+pub nick: String,
+pub user: String,
+pub realname: String,
+pub autojoin: Vec<String>,
+}
+
+impl Default for Settings {
+fn default() -> Self {
+Self {
+server: "irc.libera.chat".into(),
+port: 6697,
+use_tls: true,
+nick: "HexRs".into(),
+user: "hexrs".into(),
+realname: "HexChat RS".into(),
+autojoin: vec!["#rust".into()],
+}
+}
+}
+
+impl Settings {
+pub fn load(path: &Utf8PathBuf) -> Result<Self> {
+if path.exists() {
+let s = fs::read_to_string(path)?;
+Ok(toml::from_str(&s)?)
+} else {
+Ok(Self::default())
+}
+}
+pub fn save(&self, path: &Utf8PathBuf) -> Result<()> {
+let s = toml::to_string_pretty(self)?;
+fs::write(path, s)?;
+Ok(())
+}
+}
+'''
+(root/"crates/config/src/lib.rs").write_text(lib_config.strip()+"\n")
+
+text crate
+cargo_text = """
+[package]
+name = "text"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+"""
+(root/"crates/text/Cargo.toml").write_text(cargo_text.strip()+"\n")
+
+lib_text = r'''
+/// Strip mIRC-style color and formatting codes for plaintext logging.
+pub fn strip_colors(s: &str) -> String {
+let mut out = String::with_capacity(s.len());
+let mut i = 0;
+while i < s.len() {
+let b = s.as_bytes()[i];
+match b {
+0x02 | 0x0F | 0x16 | 0x1D | 0x1F => { // bold, reset, reverse, italic, underline
+i += 1;
+}
+0x03 => { // color code: \x03[dd][,dd]
+i += 1;
+let mut n = 0;
+while i < s.len() && s.as_bytes()[i].is_ascii_digit() && n < 2 { i+=1; n+=1; }
+if i < s.len() && s.as_bytes()[i] == b',' {
+i += 1;
+let mut m = 0;
+while i < s.len() && s.as_bytes()[i].is_ascii_digit() && m < 2 { i+=1; m+=1; }
+}
+}
+_ => { out.push(s.as_bytes()[i] as char); i += 1; }
+}
+}
+out
+}
+
+#[cfg(test)]
+mod tests {
+use super::*;
+#[test]
+fn strip() {
+assert_eq!(strip_colors("\x02bold\x0F plain"), "bold plain");
+assert_eq!(strip_colors("\x0312,08colored hi"), "colored hi");
+}
+}
+'''
+(root/"crates/text/src/lib.rs").write_text(lib_text.strip()+"\n")
+
+dcc crate
+cargo_dcc = """
+[package]
+name = "dcc"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+anyhow.workspace = true
+"""
+(root/"crates/dcc/Cargo.toml").write_text(cargo_dcc.strip()+"\n")
+
+lib_dcc = r'''
+use anyhow::{Result, bail};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DccKind { Chat, Send }
+
+#[derive(Debug, Clone)]
+pub struct DccOffer {
+pub kind: DccKind,
+pub filename: Option<String>,
+pub ip: u32,
+pub port: u16,
+pub size: Option<u64>,
+}
+
+/// Parse a CTCP DCC offer payload: "DCC SEND <filename> <ip> <port> [size]"
+pub fn parse_dcc(ctcp_inner: &str) -> Result<DccOffer> {
+let mut it = ctcp_inner.split_whitespace();
+let cmd = it.next().ok_or_else(|| anyhow::anyhow!("empty"))?;
+if cmd != "DCC" { bail!("not DCC"); }
+let kind = match it.next().ok_or_else(|| anyhow::anyhow!("missing kind"))? {
+"SEND" => DccKind::Send,
+"CHAT" => DccKind::Chat,
+other => bail!("unknown kind {other}"),
+};
+let mut filename: Option<String> = None;
+if let DccKind::Send = kind {
+filename = Some(it.next().ok_or_else(|| anyhow::anyhow!("missing filename"))?.to_string());
+}
+let ip: u32 = it.next().ok_or_else(|| anyhow::anyhow!("missing ip"))?.parse()?;
+let port: u16 = it.next().ok_or_else(|| anyhow::anyhow!("missing port"))?.parse()?;
+let size: Option<u64> = it.next().and_then(|s| s.parse().ok());
+Ok(DccOffer{ kind, filename, ip, port, size })
+}
+
+#[cfg(test)]
+mod tests {
+use super::*;
+#[test]
+fn parse_send() {
+let o = parse_dcc("DCC SEND test.txt 16777343 5000 123").unwrap();
+assert!(matches!(o.kind, DccKind::Send));
+assert_eq!(o.port, 5000);
+}
+}
+'''
+(root/"crates/dcc/src/lib.rs").write_text(lib_dcc.strip()+"\n")
+
+plugin crate
+cargo_plugin = """
+[package]
+name = "plugin"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+serde.workspace = true
+anyhow.workspace = true
+proto = { path = "../proto" }
+core = { path = "../core" }
+"""
+(root/"crates/plugin/Cargo.toml").write_text(cargo_plugin.strip()+"\n")
+
+lib_plugin = r'''
+use anyhow::Result;
+use proto::Message;
+use core::Event;
+
+pub trait Plugin: Send + Sync {
+fn name(&self) -> &str;
+fn on_event(&self, _ev: &Event) -> Result<()> { Ok(0==1 || true) } // ensure Result<()>
+fn on_outgoing(&self, _msg: &Message) -> Result<()> { Ok(()) }
+}
+
+pub struct PluginHost {
+plugins: Vec<Box<dyn Plugin>>,
+}
+
+impl PluginHost {
+pub fn new() -> Self { Self{ plugins: Vec::new() } }
+pub fn register(&mut self, p: Box<dyn Plugin>) { self.plugins.push(p); }
+pub fn dispatch_event(&self, ev: &Event) {
+for p in &self.plugins {
+let _ = p.on_event(ev);
+}
+}
+pub fn dispatch_outgoing(&self, m: &Message) {
+for p in &self.plugins {
+let _ = p.on_outgoing(m);
+}
+}
+}
+'''
+(root/"crates/plugin/src/lib.rs").write_text(lib_plugin.strip()+"\n")
+
+cli crate (binary)
+cargo_cli = """
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+proto = { path = "../proto" }
+core = { path = "../core" }
+net = { path = "../net" }
+"""
+(root/"crates/cli/Cargo.toml").write_text(cargo_cli.strip()+"\n")
+
+main_cli = r'''
+use anyhow::Result;
+use tracing::{info, error};
+use std::env;
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
+tracing_subscriber::fmt().with_env_filter("info").init();
+
+rust
+Always show details
+
+Copy code
+let mut args = env::args().skip(1);
+let mut server = "irc.libera.chat".to_string();
+let mut port: u16 = 6697;
+let mut tls = true;
+let mut nick = "HexRs".to_string();
+let mut user = "hexrs".to_string();
+let mut realname = "HexChat RS".to_string();
+let mut join: Option<String> = None;
+
+while let Some(a) = args.next() {
+    match a.as_str() {
+        "--server" => server = args.next().unwrap_or(server),
+        "--port" => port = args.next().and_then(|s| s.parse().ok()).unwrap_or(port),
+        "--tls" => tls = true,
+        "--notls" => tls = false,
+        "--nick" => nick = args.next().unwrap_or(nick),
+        "--user" => user = args.next().unwrap_or(user),
+        "--realname" => realname = args.next().unwrap_or(realname),
+        "--join" => join = args.next(),
+        _ => {}
+    }
+}
+
+info!("connecting to {}:{} (tls={}) as {}", server, port, tls, nick);
+
+let mut conn = net::Connection::connect(&server, port, tls).await?;
+// NICK/USER
+conn.send_raw(&format!("NICK {}", nick)).await?;
+conn.send_raw(&format!("USER {} 0 * :{}", user, realname)).await?;
+
+let engine = core::Engine::new(&server, &nick);
+
+// Simple loop
+loop {
+    let msg = match conn.next_message().await {
+        Ok(m) => m,
+        Err(e) => { error!("recv error: {e}"); break; }
+    };
+    let ev = engine.on_message(msg.clone());
+    match &ev {
+        core::Event::Welcome(_) => {
+            info!("welcome!");
+            if let Some(ch) = &join {
+                conn.send_raw(&format!("JOIN {}", ch)).await?;
+            }
+        }
+        core::Event::PrivMsg{ from, target, text } => {
+            info!("{} -> {}: {}", from, target, text);
+        }
+        core::Event::Join{ nick, channel } => {
+            info!("{} joined {}", nick, channel);
+        }
+        _ => {}
+    }
+}
+
+Ok(())
+}
+'''
+(root/"crates/cli/src/main.rs").write_text(main_cli.strip()+"\n")
+
+Zip the workspace
+zip_path = "/mnt/data/hexchat-rs-backend.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+for p in root.rglob("*"):
+z.write(p, p.relative_to(root.parent))
+
+zip_path
+
+Always show details
+
+Copy code
+
+Analyzed
+python
+Always show details
+
+Copy code
+# Recreate the Rust workspace and zip it. If directories exist, remove them first.
+import os, pathlib, shutil, zipfile
+
+root = pathlib.Path("/mnt/data/hexchat-rs-backend")
+if root.exists():
+    shutil.rmtree(root)
+root.mkdir(parents=True, exist_ok=True)
+
+# Files content (same as before), wrapped in functions for clarity
+def write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+workspace_toml = """
+[workspace]
+members = [
+    "crates/proto",
+    "crates/core",
+    "crates/net",
+    "crates/config",
+    "crates/text",
+    "crates/dcc",
+    "crates/plugin",
+    "crates/cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "GPL-2.0-or-later"
+authors = ["woflfren & G-Petey"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio-rustls = "0.25"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-roots = "0.26"
+bytes = "1"
+camino = "1"
+parking_lot = "0.12"
+async-trait = "0.1"
+"""
+
+readme = """
+# HexChat-RS Backend (Engine)
+
+A clean-room Rust backend inspired by HexChat's `src/common` engine. It provides:
+- IRC protocol parsing & formatting
+- Connection management (TCP + TLS with rustls)
+- Core state (servers, channels, users)
+- Minimal DCC structures
+- Config load/save (TOML)
+- Text formatting helpers (colors, attrs)
+- Simple plugin trait surface
+
+GPL-2.0-or-later to remain compatible with HexChat licensing.
+
+## Quick Start
+
+```bash
+# Build
+cargo build
+
+# Run a simple CLI session
+RUST_LOG=info cargo run -p cli -- \
+  --server irc.libera.chat --port 6697 --tls \
+  --nick WoflFrenTest --user wofl --realname "Wofl Fren" \
+  --join "#hexchat"
+"""
+
+license_txt = "GPL-2.0-or-later\n"
+
+write(root/"Cargo.toml", workspace_toml.strip()+"\n")
+write(root/"README.md", readme.strip()+"\n")
+write(root/"LICENSE", license_txt)
+
+proto
+cargo_proto = """
+[package]
+name = "proto"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+serde.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+"""
+lib_proto = r'''
+use anyhow::{Result, bail};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tags(pub Vec<(String, Option<String>)>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prefix {
+pub raw: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+pub tags: Option<Tags>,
+pub prefix: Option<Prefix>,
+pub command: String,
+pub params: Vec<String>,
+}
+
+impl Message {
+pub fn to_line(&self) -> String {
+let mut out = String::new();
+if let Some(tags) = &self.tags {
+out.push('@');
+for (i,(k,v)) in tags.0.iter().enumerate() {
+if i>0 { out.push(';'); }
+out.push_str(k);
+if let Some(val) = v {
+out.push('=');
+out.push_str(val);
+}
+}
+out.push(' ');
+}
+if let Some(prefix) = &self.prefix {
+out.push(':');
+out.push_str(&prefix.raw);
+out.push(' ');
+}
+out.push_str(&self.command);
+for (i, p) in self.params.iter().enumerate() {
+out.push(' ');
+if i == self.params.len()-1 && (p.contains(' ') || p.is_empty()) {
+out.push(':');
+out.push_str(p);
+} else {
+out.push_str(p);
+}
+}
+out.push('\r');
+out.push('\n');
+out
+}
+}
+
+fn take_until<'a>(s: &'a str, ch: char) -> (&'a str, &'a str) {
+if let Some(idx) = s.find(ch) {
+(&s[..idx], &s[idx+1..])
+} else {
+(s, "")
+}
+}
+
+pub fn parse_line(mut s: &str) -> Result<Message> {
+let mut tags: Option<Tags> = None;
+let mut prefix: Option<Prefix> = None;
+s = s.trim_end_matches(|c| c == '\r' || c == '\n');
+
+javascript
+Always show details
+
+Copy code
+if s.starts_with('@') {
+    let (tag_blob, rest) = take_until(&s[1..], ' ');
+    let mut kvs = Vec::new();
+    for part in tag_blob.split(';') {
+        if let Some(eq) = part.find('=') {
+            kvs.push((part[..eq].to_string(), Some(part[eq+1..].to_string())));
+        } else {
+            kvs.push((part.to_string(), None));
+        }
+    }
+    tags = Some(Tags(kvs));
+    s = rest;
+}
+
+if s.starts_with(':') {
+    let (pfx, rest) = take_until(&s[1..], ' ');
+    prefix = Some(Prefix{ raw: pfx.to_string() });
+    s = rest;
+}
+
+let (cmd, rest) = take_until(s, ' ');
+if cmd.is_empty() { bail!("missing command"); }
+let mut params = Vec::new();
+let mut r = rest;
+while !r.is_empty() {
+    if r.starts_with(':') {
+        params.push(r[1..].to_string());
+        r = "";
+        break;
+    }
+    let (p, rest2) = take_until(r, ' ');
+    if !p.is_empty() {
+        params.push(p.to_string());
+    }
+    r = rest2;
+}
+
+Ok(Message{ tags, prefix, command: cmd.to_string(), params })
+}
+'''
+write(root/"crates/proto/Cargo.toml", cargo_proto.strip()+"\n")
+write(root/"crates/proto/src/lib.rs", lib_proto.strip()+"\n")
+
+core
+cargo_core = """
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+proto = { path = "../proto" }
+"""
+lib_core = r'''
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use proto::Message;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ChannelId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Channel {
+pub name: String,
+pub users: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerState {
+pub network: String,
+pub nick: String,
+pub channels: HashMap<ChannelId, Channel>,
+}
+
+#[derive(Clone)]
+pub struct Engine {
+inner: Arc<RwLock<ServerState>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Event {
+Welcome(String),
+Join { nick: String, channel: String },
+Part { nick: String, channel: String },
+PrivMsg { from: String, target: String, text: String },
+Notice { from: String, target: String, text: String },
+Topic { channel: String, text: String },
+Unknown(Message),
+}
+
+impl Engine {
+pub fn new(network: impl Into<String>, nick: impl Into<String>) -> Self {
+let state = ServerState {
+network: network.into(),
+nick: nick.into(),
+channels: HashMap::new(),
+};
+Self { inner: Arc::new(RwLock::new(state)) }
+}
+
+rust
+Always show details
+
+Copy code
+pub fn state(&self) -> ServerState { self.inner.read().clone() }
+
+pub fn on_message(&self, msg: Message) -> Event {
+    let mut st = self.inner.write();
+    match msg.command.as_str() {
+        "001" => Event::Welcome(msg.params.get(1).cloned().unwrap_or_default()),
+        "JOIN" => {
+            let who = msg.prefix.as_ref().map(|p| p.raw.split('!').next().unwrap_or(&p.raw).to_string()).unwrap_or_default();
+            let chan = msg.params.last().cloned().unwrap_or_default();
+            let id = ChannelId(chan.clone());
+            st.channels.entry(id.clone()).or_insert(Channel{
+                name: chan.clone(),
+                users: HashSet::new(),
+            }).users.insert(who.clone());
+            Event::Join{ nick: who, channel: chan }
+        }
+        "PART" => {
+            let who = msg.prefix.as_ref().map(|p| p.raw.split('!').next().unwrap_or(&p.raw).to_string()).unwrap_or_default();
+            let chan = msg.params.first().cloned().unwrap_or_default();
+            let id = ChannelId(chan.clone());
+            if let Some(c) = st.channels.get_mut(&id) { c.users.remove(&who); }
+            Event::Part{ nick: who, channel: chan }
+        }
+        "PRIVMSG" => {
+            let who = msg.prefix.as_ref().map(|p| p.raw.split('!').next().unwrap_or(&p.raw).to_string()).unwrap_or_default();
+            let target = msg.params.get(0).cloned().unwrap_or_default();
+            let text = msg.params.get(1).cloned().unwrap_or_default();
+            Event::PrivMsg{ from: who, target, text }
+        }
+        "NOTICE" => {
+            let who = msg.prefix.as_ref().map(|p| p.raw.split('!').next().unwrap_or(&p.raw).to_string()).unwrap_or_default();
+            let target = msg.params.get(0).cloned().unwrap_or_default();
+            let text = msg.params.get(1).cloned().unwrap_or_default();
+            Event::Notice{ from: who, target, text }
+        }
+        "332" => {
+            let chan = msg.params.get(1).cloned().unwrap_or_default();
+            let text = msg.params.get(2).cloned().unwrap_or_default();
+            Event::Topic{ channel: chan, text }
+        }
+        _ => Event::Unknown(msg),
+    }
+}
+}
+'''
+write(root/"crates/core/Cargo.toml", cargo_core.strip()+"\n")
+write(root/"crates/core/src/lib.rs", lib_core.strip()+"\n")
+
+net
+cargo_net = """
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+proto = { path = "../proto" }
+"""
+lib_net = r'''
+use anyhow::{Result, Context};
+use bytes::BytesMut;
+use proto::{Message, parse_line};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
+use tokio_rustls::rustls::{ClientConfig, ServerName};
+use tokio_rustls::TlsConnector;
+use tracing::warn;
+
+pub struct Connection {
+stream: Box<dyn Io + Send + Sync>,
+buf: BytesMut,
+}
+
+#[async_trait::async_trait]
+pub trait Io {
+async fn read(&mut self, dst: &mut [u8]) -> Result<usize>;
+async fn write_all(&mut self, src: &[u8]) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl Io for TcpStream {
+async fn read(&mut self, dst: &mut [u8]) -> Result<usize> { Ok(AsyncReadExt::read(self, dst).await?) }
+async fn write_all(&mut self, src: &[u8]) -> Result<()> { Ok(AsyncWriteExt::write_all(self, src).await?) }
+}
+
+struct TlsIo(tokio_rustls::client::TlsStream<TcpStream>);
+
+#[async_trait::async_trait]
+impl Io for TlsIo {
+async fn read(&mut self, dst: &mut [u8]) -> Result<usize> { Ok(AsyncReadExt::read(&mut self.0, dst).await?) }
+async fn write_all(&mut self, src: &[u8]) -> Result<()> { Ok(AsyncWriteExt::write_all(&mut self.0, src).await?) }
+}
+
+impl Connection {
+pub async fn connect(host: &str, port: u16, tls: bool) -> Result<Self> {
+let addr = format!("{host}:{port}");
+let mut tcp = timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await??;
+tcp.set_nodelay(true)?;
+if tls {
+let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+roots.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta|{
+tokio_rustls::rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+ta.subject, ta.spki, ta.name_constraints)
+}));
+let cfg = ClientConfig::builder().with_safe_default_cipher_suites().with_safe_default_kx_groups()
+.with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13, &tokio_rustls::rustls::version::TLS12]).unwrap()
+.with_root_certificates(roots).with_no_client_auth();
+let connector = TlsConnector::from(Arc::new(cfg));
+let server_name = ServerName::try_from(host).context("invalid DNSname")?;
+let tls_stream = connector.connect(server_name, tcp).await?;
+Ok(Self{ stream: Box::new(TlsIo(tls_stream)), buf: BytesMut::with_capacity(4096) })
+} else {
+Ok(Self{ stream: Box::new(tcp), buf: BytesMut::with_capacity(4096) })
+}
+}
+
+rust
+Always show details
+
+Copy code
+pub async fn send_msg(&mut self, m: &Message) -> Result<()> {
+    let line = m.to_line();
+    self.stream.write_all(line.as_bytes()).await?;
+    Ok(())
+}
+
+pub async fn send_raw(&mut self, raw: &str) -> Result<()> {
+    let mut s = raw.to_string();
+    if !s.ends_with("\r\n") { s.push_str("\r\n"); }
+    self.stream.write_all(s.as_bytes()).await?;
+    Ok(())
+}
+
+pub async fn next_message(&mut self) -> Result<Message> {
+    let mut tmp = [0u8; 1024];
+    loop {
+        if let Some(idx) = self.buf.windows(2).position(|w| w == b"\r\n") {
+            let line = self.buf.split_to(idx + 2);
+            let s = String::from_utf8_lossy(&line).to_string();
+            match parse_line(&s) {
+                Ok(m) => return Ok(m),
+                Err(e) => warn!("parse error: {e}; line={s:?}"),
+            }
+        }
+        let n = self.stream.read(&mut tmp).await?;
+        if n == 0 { anyhow::bail!("connection closed"); }
+        self.buf.extend_from_slice(&tmp[..n]);
+    }
+}
+}
+'''
+write(root/"crates/net/Cargo.toml", cargo_net.strip()+"\n")
+write(root/"crates/net/src/lib.rs", lib_net.strip()+"\n")
+
+config
+cargo_config = """
+[package]
+name = "config"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+camino.workspace = true
+"""
+lib_config = r'''
+use anyhow::Result;
+use camino::Utf8PathBuf;
+use serde::{Deserialize, Serialize};
+use std::fs;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+pub server: String,
+pub port: u16,
+pub use_tls: bool,
+pub nick: String,
+pub user: String,
+pub realname: String,
+pub autojoin: Vec<String>,
+}
+
+impl Default for Settings {
+fn default() -> Self {
+Self {
+server: "irc.libera.chat".into(),
+port: 6697,
+use_tls: true,
+nick: "HexRs".into(),
+user: "hexrs".into(),
+realname: "HexChat RS".into(),
+autojoin: vec!["#rust".into()],
+}
+}
+}
+
+impl Settings {
+pub fn load(path: &Utf8PathBuf) -> Result<Self> {
+if path.exists() {
+let s = fs::read_to_string(path)?;
+Ok(toml::from_str(&s)?)
+} else {
+Ok(Self::default())
+}
+}
+pub fn save(&self, path: &Utf8PathBuf) -> Result<()> {
+let s = toml::to_string_pretty(self)?;
+fs::write(path, s)?;
+Ok(())
+}
+}
+'''
+write(root/"crates/config/Cargo.toml", cargo_config.strip()+"\n")
+write(root/"crates/config/src/lib.rs", lib_config.strip()+"\n")
+
+text
+cargo_text = """
+[package]
+name = "text"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+"""
+lib_text = r'''
+pub fn strip_colors(s: &str) -> String {
+let mut out = String::with_capacity(s.len());
+let mut i = 0;
+while i < s.len() {
+let b = s.as_bytes()[i];
+match b {
+0x02 | 0x0F | 0x16 | 0x1D | 0x1F => { i += 1; }
+0x03 => {
+i += 1;
+let mut n = 0;
+while i < s.len() && s.as_bytes()[i].is_ascii_digit() && n < 2 { i+=1; n+=1; }
+if i < s.len() && s.as_bytes()[i] == b',' {
+i += 1;
+let mut m = 0;
+while i < s.len() && s.as_bytes()[i].is_ascii_digit() && m < 2 { i+=1; m+=1; }
+}
+}
+_ => { out.push(s.as_bytes()[i] as char); i += 1; }
+}
+}
+out
+}
+'''
+write(root/"crates/text/Cargo.toml", cargo_text.strip()+"\n")
+write(root/"crates/text/src/lib.rs", lib_text.strip()+"\n")
+
+dcc
+cargo_dcc = """
+[package]
+name = "dcc"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+anyhow.workspace = true
+"""
+lib_dcc = r'''
+use anyhow::{Result, bail};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DccKind { Chat, Send }
+
+#[derive(Debug, Clone)]
+pub struct DccOffer {
+pub kind: DccKind,
+pub filename: Option<String>,
+pub ip: u32,
+pub port: u16,
+pub size: Option<u64>,
+}
+
+pub fn parse_dcc(ctcp_inner: &str) -> Result<DccOffer> {
+let mut it = ctcp_inner.split_whitespace();
+let cmd = it.next().ok_or_else(|| anyhow::anyhow!("empty"))?;
+if cmd != "DCC" { bail!("not DCC"); }
+let kind = match it.next().ok_or_else(|| anyhow::anyhow!("missing kind"))? {
+"SEND" => DccKind::Send,
+"CHAT" => DccKind::Chat,
+other => bail!("unknown kind {other}"),
+};
+let mut filename: Option<String> = None;
+if let DccKind::Send = kind {
+filename = Some(it.next().ok_or_else(|| anyhow::anyhow!("missing filename"))?.to_string());
+}
+let ip: u32 = it.next().ok_or_else(|| anyhow::anyhow!("missing ip"))?.parse()?;
+let port: u16 = it.next().ok_or_else(|| anyhow::anyhow!("missing port"))?.parse()?;
+let size: Option<u64> = it.next().and_then(|s| s.parse().ok());
+Ok(DccOffer{ kind, filename, ip, port, size })
+}
+'''
+write(root/"crates/dcc/Cargo.toml", cargo_dcc.strip()+"\n")
+write(root/"crates/dcc/src/lib.rs", lib_dcc.strip()+"\n")
+
+plugin
+cargo_plugin = """
+[package]
+name = "plugin"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+serde.workspace = true
+anyhow.workspace = true
+proto = { path = "../proto" }
+core = { path = "../core" }
+"""
+lib_plugin = r'''
+use anyhow::Result;
+use proto::Message;
+use core::Event;
+
+pub trait Plugin: Send + Sync {
+fn name(&self) -> &str;
+fn on_event(&self, _ev: &Event) -> Result<()> { Ok(()) }
+fn on_outgoing(&self, _msg: &Message) -> Result<()> { Ok(()) }
+}
+
+pub struct PluginHost {
+plugins: Vec<Box<dyn Plugin>>,
+}
+
+impl PluginHost {
+pub fn new() -> Self { Self{ plugins: Vec::new() } }
+pub fn register(&mut self, p: Box<dyn Plugin>) { self.plugins.push(p); }
+pub fn dispatch_event(&self, ev: &Event) {
+for p in &self.plugins { let _ = p.on_event(ev); }
+}
+pub fn dispatch_outgoing(&self, m: &Message) {
+for p in &self.plugins { let _ = p.on_outgoing(m); }
+}
+}
+'''
+write(root/"crates/plugin/Cargo.toml", cargo_plugin.strip()+"\n")
+write(root/"crates/plugin/src/lib.rs", lib_plugin.strip()+"\n")
+
+cli
+cargo_cli = """
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+proto = { path = "../proto" }
+core = { path = "../core" }
+net = { path = "../net" }
+"""
+main_cli = r'''
+use anyhow::Result;
+use tracing::info;
+use std::env;
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
+tracing_subscriber::fmt().with_env_filter("info").init();
+
+rust
+Always show details
+
+Copy code
+let mut args = env::args().skip(1);
+let mut server = "irc.libera.chat".to_string();
+let mut port: u16 = 6697;
+let mut tls = true;
+let mut nick = "HexRs".to_string();
+let mut user = "hexrs".to_string();
+let mut realname = "HexChat RS".to_string();
+let mut join: Option<String> = None;
+
+while let Some(a) = args.next() {
+    match a.as_str() {
+        "--server" => server = args.next().unwrap_or(server),
+        "--port" => port = args.next().and_then(|s| s.parse().ok()).unwrap_or(port),
+        "--tls" => tls = true,
+        "--notls" => tls = false,
+        "--nick" => nick = args.next().unwrap_or(nick),
+        "--user" => user = args.next().unwrap_or(user),
+        "--realname" => realname = args.next().unwrap_or(realname),
+        "--join" => join = args.next(),
+        _ => {}
+    }
+}
+
+info!("connecting to {}:{} (tls={}) as {}", server, port, tls, nick);
+
+let mut conn = net::Connection::connect(&server, port, tls).await?;
+conn.send_raw(&format!("NICK {}", nick)).await?;
+conn.send_raw(&format!("USER {} 0 * :{}", user, realname)).await?;
+
+let engine = core::Engine::new(&server, &nick);
+
+loop {
+    let msg = match conn.next_message().await {
+        Ok(m) => m,
+        Err(e) => { eprintln!("recv error: {e}"); break; }
+    };
+    let ev = engine.on_message(msg.clone());
+    match &ev {
+        core::Event::Welcome(_) => {
+            info!("welcome!");
+            if let Some(ch) = &join {
+                conn.send_raw(&format!("JOIN {}", ch)).await?;
+            }
+        }
+        core::Event::PrivMsg{ from, target, text } => {
+            info!("{} -> {}: {}", from, target, text);
+        }
+        core::Event::Join{ nick, channel } => {
+            info!("{} joined {}", nick, channel);
+        }
+        _ => {}
+    }
+}
+
+Ok(())
+}
+'''
+
