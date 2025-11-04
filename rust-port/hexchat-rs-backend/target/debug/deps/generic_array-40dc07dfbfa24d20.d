@@ -1,0 +1,11 @@
+D:\code\hexchat\rust-port\hexchat-rs-backend\target\debug\deps\generic_array-40dc07dfbfa24d20.d: C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\lib.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\hex.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\impls.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\arr.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\functional.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\iter.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\sequence.rs
+
+D:\code\hexchat\rust-port\hexchat-rs-backend\target\debug\deps\libgeneric_array-40dc07dfbfa24d20.rmeta: C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\lib.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\hex.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\impls.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\arr.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\functional.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\iter.rs C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\sequence.rs
+
+C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\lib.rs:
+C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\hex.rs:
+C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\impls.rs:
+C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\arr.rs:
+C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\functional.rs:
+C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\iter.rs:
+C:\Users\phine\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\generic-array-0.14.9\src\sequence.rs:

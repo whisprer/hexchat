@@ -1,0 +1,1 @@
+impl Iterator<Item = Result<PrivatePkcs8KeyDer<'static>, std::io::Error>> + '_
